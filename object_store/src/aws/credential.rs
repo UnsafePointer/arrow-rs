@@ -335,6 +335,26 @@ impl CredentialProvider for InstanceCredentialProvider {
     }
 }
 
+#[derive(Debug)]
+pub struct ContainerInstanceCredentialProvider {
+    pub cache: TokenCache<Arc<AwsCredential>>,
+    pub client: Client,
+    pub retry_config: RetryConfig,
+    pub metadata_endpoint: String,
+}
+
+impl CredentialProvider for ContainerInstanceCredentialProvider {
+    fn get_credential(&self) -> BoxFuture<'_, Result<Arc<AwsCredential>>> {
+        Box::pin(self.cache.get_or_insert_with(|| {
+            ecs_instance_creds(&self.client, &self.retry_config, &self.metadata_endpoint)
+                .map_err(|source| crate::Error::Generic {
+                    store: "S3",
+                    source,
+                })
+        }))
+    }
+}
+
 /// Credentials sourced using AssumeRoleWithWebIdentity
 ///
 /// <https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts-technical-overview.html>
@@ -385,6 +405,44 @@ impl From<InstanceCredentials> for AwsCredential {
             token: Some(s.token),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ContainerInstanceCredentials {
+    access_key_id: String,
+    expiration: DateTime<Utc>,
+    role_arn: String,
+    secret_access_key: String,
+    token: String,
+}
+
+impl From<ContainerInstanceCredentials> for AwsCredential {
+    fn from(s: ContainerInstanceCredentials) -> Self {
+        Self {
+            key_id: s.access_key_id,
+            secret_key: s.secret_access_key,
+            token: Some(s.token),
+        }
+    }
+}
+
+async fn ecs_instance_creds(
+    client: &Client,
+    retry_config: &RetryConfig,
+    endpoint: &str,
+) -> Result<TemporaryToken<Arc<AwsCredential>>, StdError> {
+    let creds_request = client.request(Method::GET, endpoint);
+
+    let creds: ContainerInstanceCredentials =
+        creds_request.send_retry(retry_config).await?.json().await?;
+
+    let now = Utc::now();
+    let ttl = (creds.expiration - now).to_std().unwrap_or_default();
+    Ok(TemporaryToken {
+        token: Arc::new(creds.into()),
+        expiry: Instant::now() + ttl,
+    })
 }
 
 /// <https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#instance-metadata-security-credentials>

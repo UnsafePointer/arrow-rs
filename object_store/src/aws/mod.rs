@@ -55,6 +55,8 @@ use crate::{
     RetryConfig, StreamExt,
 };
 
+use self::credential::ContainerInstanceCredentialProvider;
+
 mod client;
 mod credential;
 
@@ -74,6 +76,9 @@ const STRICT_PATH_ENCODE_SET: percent_encoding::AsciiSet = STRICT_ENCODE_SET.rem
 
 /// Default metadata endpoint
 static METADATA_ENDPOINT: &str = "http://169.254.169.254";
+
+/// ECS metadata endpoint
+static ECS_METADATA_ENDPOINT: &str = "http://169.254.170.2";
 
 /// A specialized `Error` for object store-related errors
 #[derive(Debug, Snafu)]
@@ -422,8 +427,10 @@ impl AmazonS3Builder {
         if let Ok(metadata_relative_uri) =
             std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
         {
-            builder.metadata_endpoint =
-                Some(format!("{}{}", METADATA_ENDPOINT, metadata_relative_uri));
+            builder.metadata_endpoint = Some(format!(
+                "{}{}",
+                ECS_METADATA_ENDPOINT, metadata_relative_uri
+            ));
         }
 
         if let Ok(text) = std::env::var("AWS_ALLOW_HTTP") {
@@ -608,20 +615,36 @@ impl AmazonS3Builder {
                         profile_credentials(profile, region.clone())?
                     }
                     None => {
-                        info!("Using Instance credential provider");
-
                         // The instance metadata endpoint is access over HTTP
                         let client = Client::builder().https_only(false).build().unwrap();
 
-                        Box::new(InstanceCredentialProvider {
-                            cache: Default::default(),
-                            client,
-                            retry_config: self.retry_config.clone(),
-                            imdsv1_fallback: self.imdsv1_fallback,
-                            metadata_endpoint: self
-                                .metadata_endpoint
-                                .unwrap_or_else(|| METADATA_ENDPOINT.into()),
-                        }) as _
+                        match std::env::var("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") {
+                            Ok(_) => {
+                                info!("Using Container Instance credential provider");
+
+                                Box::new(ContainerInstanceCredentialProvider {
+                                    cache: Default::default(),
+                                    client,
+                                    retry_config: self.retry_config.clone(),
+                                    metadata_endpoint: self
+                                        .metadata_endpoint
+                                        .unwrap_or_else(|| ECS_METADATA_ENDPOINT.into()),
+                                }) as _
+                            }
+                            _ => {
+                                info!("Using Instance credential provider");
+
+                                Box::new(InstanceCredentialProvider {
+                                    cache: Default::default(),
+                                    client,
+                                    retry_config: self.retry_config.clone(),
+                                    imdsv1_fallback: self.imdsv1_fallback,
+                                    metadata_endpoint: self
+                                        .metadata_endpoint
+                                        .unwrap_or_else(|| METADATA_ENDPOINT.into()),
+                                }) as _
+                            }
+                        }
                     }
                 },
             },
